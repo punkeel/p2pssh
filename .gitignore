@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config files (may contain keys)
+*.json
+!example-*.json

@@ -1,0 +1,107 @@
+# p2pssh systemd service unit
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/p2pssh.service
+#   2. Copy the p2pssh binary to /usr/local/bin/p2pssh
+#   3. Create the directory: mkdir -p /var/lib/p2pssh
+#   4. Reload systemd: systemctl daemon-reload
+#   5. Enable and start: systemctl enable --now p2pssh.service
+#
+# The service will auto-generate a secret key on first run at:
+#   /var/lib/p2pssh/secret.key
+#
+# To get your peer ID after starting:
+#   journalctl -u p2pssh.service
+#   or run: p2pssh id --key /var/lib/p2pssh/secret.key
+
+[Unit]
+Description=P2P SSH Tunnel Service
+Documentation=https://github.com/punkeel/p2pssh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/p2pssh serve --key /var/lib/p2pssh/secret.key
+
+# Restart configuration
+Restart=on-failure
+RestartSec=5s
+
+# User and group (DynamicUser creates ephemeral user/group)
+# We can't use DynamicUser=yes because we need persistent key storage
+# Instead, create a dedicated user/group:
+#   useradd --system --home-dir /var/lib/p2pssh --shell /sbin/nologin p2pssh
+User=p2pssh
+Group=p2pssh
+
+# State directory (automatically created with correct permissions)
+StateDirectory=p2pssh
+StateDirectoryMode=0700
+
+# Security Hardening
+# Filesystem access restrictions
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/p2pssh
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Namespace isolation
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# System call filtering
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Capability restrictions
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Network restrictions
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Restrict realtime scheduling
+RestrictRealtime=yes
+
+# Prevent access to special file systems
+ProtectProc=invisible
+ProcSubset=pid
+
+# Namespace restrictions
+PrivateUsers=yes
+RestrictNamespaces=yes
+
+# Lock down memory
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Restrict SUID/SGID
+RestrictSUIDSGID=yes
+
+# Remove unnecessary privileges
+RemoveIPC=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=p2pssh
+
+# Resource limits
+# LimitNOFILE=65536
+# LimitNPROC=512
+
+# Additional hardening (uncomment if compatible with your system)
+# PrivateMounts=yes
+# PrivateIPC=yes
+
+[Install]
+WantedBy=multi-user.target
