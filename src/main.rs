@@ -1,74 +1,18 @@
 use anyhow::{Result, bail};
 use iroh::PublicKey;
 use iroh::endpoint_info::EndpointIdExt;
-use iroh::{Endpoint, EndpointAddr, SecretKey};
-use quinn::{RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
+use noq::{RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::select;
-use tracing::Event;
-use tracing::span::{Attributes, Id};
-use tracing::{Level, Metadata, Subscriber, info, warn};
+use tracing::{info, warn};
 
 /// ALPN for p2pssh protocol
 const ALPN: &[u8] = b"p2pssh/1";
-
-/// Minimal tracing subscriber that writes to stderr
-struct SimpleSubscriber;
-
-impl Subscriber for SimpleSubscriber {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        // Only show info and above by default (can be controlled via RUST_LOG)
-        metadata.level() <= &Level::INFO
-    }
-
-    fn new_span(&self, _span: &Attributes<'_>) -> Id {
-        Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
-
-    fn event(&self, event: &Event<'_>) {
-        let metadata = event.metadata();
-        let level = metadata.level();
-
-        // Format: LEVEL message
-        let level_str = match *level {
-            Level::ERROR => "ERROR",
-            Level::WARN => "WARN",
-            Level::INFO => "INFO",
-            Level::DEBUG => "DEBUG",
-            Level::TRACE => "TRACE",
-        };
-
-        // Extract the message
-        struct MessageVisitor(String);
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{:?}", value);
-                    // Remove quotes added by Debug formatting
-                    if self.0.starts_with('"') && self.0.ends_with('"') {
-                        self.0 = self.0[1..self.0.len() - 1].to_string();
-                    }
-                }
-            }
-        }
-
-        let mut visitor = MessageVisitor(String::new());
-        event.record(&mut visitor);
-
-        eprintln!("{} {}", level_str, visitor.0);
-    }
-
-    fn enter(&self, _span: &Id) {}
-    fn exit(&self, _span: &Id) {}
-}
 
 /// Default path for storing the secret key
 fn default_key_path() -> PathBuf {
@@ -329,9 +273,19 @@ OPTIONS:
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize minimal tracing subscriber
-    tracing::subscriber::set_global_default(SimpleSubscriber)
-        .expect("setting default subscriber failed");
+    // Initialize tracing subscriber with env filter
+    // Default to WARN level, can be overridden with RUST_LOG environment variable
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_target(false)
+        .with_level(true)
+        .without_time()
+        .with_ansi(false)
+        .init();
 
     let command = parse_args()?;
 
@@ -372,7 +326,7 @@ async fn cmd_serve(ssh_host: String, key_path: Option<PathBuf>, bind: String) ->
     let bind_addr: SocketAddr = bind.parse()?;
 
     // Create iroh endpoint
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .bind_addr(bind_addr)?
@@ -460,7 +414,7 @@ async fn cmd_connect(peer_id_str: String, key_path: Option<PathBuf>, bind: Strin
     let bind_addr: SocketAddr = bind.parse()?;
 
     // Create iroh endpoint
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .bind_addr(bind_addr)?
         .bind()
