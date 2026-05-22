@@ -1,8 +1,7 @@
 use anyhow::{Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
-    endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks},
-    endpoint_info::EndpointIdExt,
+    endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks},
 };
 use noq::{RecvStream, SendStream};
 use std::collections::HashSet;
@@ -82,7 +81,7 @@ fn load_or_generate_secret_key(path: &PathBuf) -> Result<SecretKey> {
         return Ok(SecretKey::from_bytes(&key_bytes));
     }
     info!("Generating new secret key at: {}", path.display());
-    let key = SecretKey::generate(&mut rand::rng());
+    let key = SecretKey::generate();
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -143,7 +142,7 @@ impl AuthHook {
 impl EndpointHooks for AuthHook {
     async fn after_handshake<'a>(
         &'a self,
-        conn: &'a ConnectionInfo,
+        conn: &'a Connection,
     ) -> AfterHandshakeOutcome {
         if self.allowed.is_empty() || self.allowed.contains(&conn.remote_id()) {
             AfterHandshakeOutcome::Accept
@@ -390,8 +389,8 @@ async fn build_endpoint(
     authorized_keys: Option<HashSet<EndpointId>>,
     alpns: Vec<Vec<u8>>,
 ) -> Result<Endpoint> {
-    let endpoint_id = secret_key.public();
-    let mut builder = iroh::Endpoint::empty_builder()
+    let _endpoint_id = secret_key.public();
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key)
         .bind_addr(bind)?;
 
@@ -411,9 +410,7 @@ async fn build_endpoint(
 
     if mdns {
         info!("Enabling mDNS discovery");
-        let mdns_lookup = iroh::address_lookup::MdnsAddressLookup::builder()
-            .build(endpoint_id)?;
-        builder = builder.address_lookup(mdns_lookup);
+        builder = builder.address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
     }
 
     if let Some(keys) = authorized_keys

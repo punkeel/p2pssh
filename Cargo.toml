@@ -14,8 +14,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { version = "1.0.102", default-features = false, features = ["std"] }
 lexopt = { version = "0.3.2", default-features = false }
-iroh = { version = "0.97", default-features = false, features = ["address-lookup-mdns"] }
-noq = "0.17"
+iroh = { version = "1.0.0-rc.0", default-features = false, features = ["tls-ring"] }
+noq = "1.0.0-rc.0"
+iroh-mdns-address-lookup = "0.2.0"
 tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "macros", "fs", "signal"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
