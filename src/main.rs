@@ -587,6 +587,12 @@ async fn cmd_connect(
 
     let bind_addr: SocketAddr = bind.parse()?;
 
+    let addr = if let Some(ref url) = relay_url {
+        EndpointAddr::from(endpoint_id).with_relay_url(url.clone())
+    } else {
+        EndpointAddr::from(endpoint_id)
+    };
+
     let endpoint = build_endpoint(
         secret_key,
         bind_addr,
@@ -599,8 +605,6 @@ async fn cmd_connect(
 
     info!("Waiting for endpoint to come online...");
     let _ = tokio::time::timeout(Duration::from_secs(30), endpoint.online()).await;
-
-    let addr = EndpointAddr::from(endpoint_id);
 
     info!("Connecting to {}...", peer_id_str);
     let connection = endpoint.connect(addr, ALPN).await?;
