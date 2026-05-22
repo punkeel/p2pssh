@@ -11,6 +11,10 @@ readme = "README.md"
 name = "p2pssh"
 path = "src/main.rs"
 
+[lib]
+name = "p2pssh"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = { version = "1.0.102", default-features = false, features = ["std"] }
 lexopt = { version = "0.3.2", default-features = false }
@@ -26,6 +30,9 @@ hostname = { version = "0.4.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.186", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = "z"
