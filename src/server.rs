@@ -1,7 +1,5 @@
 use anyhow::Result;
-use iroh::{
-    Endpoint, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
-};
+use iroh::{Endpoint, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -128,7 +126,9 @@ pub async fn cmd_serve(
     let conn_limit = Arc::new(Semaphore::new(max_connections));
 
     #[cfg(unix)]
-    let mut sigterm = Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?);
+    let mut sigterm = Some(tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?);
     #[cfg(not(unix))]
     let mut sigterm: Option<tokio::signal::unix::Signal> = None;
 
@@ -139,7 +139,7 @@ pub async fn cmd_serve(
                     Ok(p) => p,
                     Err(_) => {
                         warn!("Connection limit ({}) reached; rejecting incoming connection", max_connections);
-                        let _ = incoming.refuse();
+                        incoming.refuse();
                         continue;
                     }
                 };

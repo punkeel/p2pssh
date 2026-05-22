@@ -14,7 +14,13 @@ pub fn default_key_path() -> PathBuf {
     } else {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(PathBuf::from(s)) })
+            .and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                }
+            })
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
@@ -32,7 +38,13 @@ pub fn default_authorized_keys_path() -> PathBuf {
     } else {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(PathBuf::from(s)) })
+            .and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                }
+            })
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
@@ -322,7 +334,9 @@ mod tests {
             max_connections: 100,
         };
         match cmd {
-            Command::Serve { max_connections, .. } => {
+            Command::Serve {
+                max_connections, ..
+            } => {
                 assert_eq!(max_connections, 100);
             }
             _ => panic!("Expected Serve command"),

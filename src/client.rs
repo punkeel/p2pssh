@@ -30,15 +30,7 @@ pub async fn cmd_connect(
         EndpointAddr::from(endpoint_id)
     };
 
-    let endpoint = build_endpoint(
-        secret_key,
-        bind_addr,
-        relay_url,
-        mdns,
-        None,
-        vec![],
-    )
-    .await?;
+    let endpoint = build_endpoint(secret_key, bind_addr, relay_url, mdns, None, vec![]).await?;
 
     info!("Waiting for endpoint to come online...");
     match tokio::time::timeout(std::time::Duration::from_secs(30), endpoint.online()).await {

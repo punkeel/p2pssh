@@ -53,8 +53,6 @@ async fn main() -> Result<()> {
             bind,
             relay_url,
             mdns,
-        } => {
-            p2pssh::client::cmd_connect(peer_id, key_path, bind, relay_url, mdns).await
-        }
+        } => p2pssh::client::cmd_connect(peer_id, key_path, bind, relay_url, mdns).await,
     }
 }

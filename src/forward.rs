@@ -6,7 +6,11 @@ use tokio::net::TcpStream;
 use crate::config::FORWARD_BUF_SIZE;
 
 /// Forward data between TCP stream and QUIC streams, shutting down gracefully
-pub async fn forward_bidi(tcp_stream: TcpStream, mut recv: RecvStream, mut send: SendStream) -> Result<()> {
+pub async fn forward_bidi(
+    tcp_stream: TcpStream,
+    mut recv: RecvStream,
+    mut send: SendStream,
+) -> Result<()> {
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
     // QUIC → TCP
@@ -110,6 +114,7 @@ mod tests {
     #[tokio::test]
     async fn test_forward_bidi_stdio_signature() {
         // Ensure the function compiles with concrete types
-        let _f: fn(tokio::io::Stdin, tokio::io::Stdout, RecvStream, SendStream) -> _ = forward_bidi_stdio;
+        let _f: fn(tokio::io::Stdin, tokio::io::Stdout, RecvStream, SendStream) -> _ =
+            forward_bidi_stdio;
     }
 }

@@ -69,7 +69,11 @@ pub fn load_authorized_keys(path: &PathBuf) -> Result<HashSet<EndpointId>> {
             path.display()
         );
     }
-    info!("Loaded {} authorized keys from {}", keys.len(), path.display());
+    info!(
+        "Loaded {} authorized keys from {}",
+        keys.len(),
+        path.display()
+    );
     Ok(keys)
 }
 
@@ -88,10 +92,7 @@ impl AuthHook {
 }
 
 impl EndpointHooks for AuthHook {
-    async fn after_handshake<'a>(
-        &'a self,
-        conn: &'a Connection,
-    ) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         if self.allowed.contains(&conn.remote_id()) {
             AfterHandshakeOutcome::Accept
         } else {
@@ -146,7 +147,7 @@ mod tests {
     fn test_load_authorized_keys_invalid_lines() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(tmp, "not-a-valid-z32-key").unwrap();
-        writeln!(tmp, "{}" , SecretKey::generate().public().to_z32()).unwrap();
+        writeln!(tmp, "{}", SecretKey::generate().public().to_z32()).unwrap();
 
         let keys = load_authorized_keys(&tmp.path().to_path_buf()).unwrap();
         assert_eq!(keys.len(), 1);
@@ -192,6 +193,11 @@ mod tests {
         tmp.write_all(b"too-short").unwrap();
         let result = load_or_generate_secret_key(&tmp.path().to_path_buf());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected 32 bytes"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expected 32 bytes")
+        );
     }
 }
