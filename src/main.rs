@@ -1,10 +1,14 @@
 use anyhow::{Result, bail};
-use iroh::PublicKey;
-use iroh::endpoint_info::EndpointIdExt;
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks},
+    endpoint_info::EndpointIdExt,
+};
 use noq::{RecvStream, SendStream};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,31 +18,42 @@ use tracing::{info, warn};
 /// ALPN for p2pssh protocol
 const ALPN: &[u8] = b"p2pssh/1";
 
+/// Buffer size for forwarding
+const FORWARD_BUF_SIZE: usize = 65536;
+
 /// Default path for storing the secret key
 fn default_key_path() -> PathBuf {
-    // Root user uses /etc/p2pssh/secret.key
-    // Non-root users use XDG_CONFIG_HOME/p2pssh/secret.key or ~/.config/p2pssh/secret.key
     if is_root() {
         PathBuf::from("/etc/p2pssh/secret.key")
     } else {
-        // Use XDG_CONFIG_HOME if available, otherwise ~/.config
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
-            .and_then(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(s))
-                }
-            })
+            .and_then(|s| if s.is_empty() { None } else { Some(PathBuf::from(s)) })
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
                     .map(|home| PathBuf::from(home).join(".config"))
             })
             .unwrap_or_else(|| PathBuf::from("."));
-
         config_dir.join("p2pssh").join("secret.key")
+    }
+}
+
+/// Default path for authorized keys
+fn default_authorized_keys_path() -> PathBuf {
+    if is_root() {
+        PathBuf::from("/etc/p2pssh/authorized_keys")
+    } else {
+        let config_dir = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .and_then(|s| if s.is_empty() { None } else { Some(PathBuf::from(s)) })
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        config_dir.join("p2pssh").join("authorized_keys")
     }
 }
 
@@ -46,10 +61,8 @@ fn default_key_path() -> PathBuf {
 fn is_root() -> bool {
     #[cfg(unix)]
     {
-        // SAFETY: getuid is always safe to call
         unsafe { libc::getuid() == 0 }
     }
-
     #[cfg(not(unix))]
     {
         false
@@ -71,15 +84,12 @@ fn load_or_generate_secret_key(path: &PathBuf) -> Result<SecretKey> {
     info!("Generating new secret key at: {}", path.display());
     let key = SecretKey::generate(&mut rand::rng());
 
-    // Create parent directory if needed
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Write key with restricted permissions
     std::fs::write(path, key.to_bytes())?;
 
-    // Set restrictive permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -91,6 +101,65 @@ fn load_or_generate_secret_key(path: &PathBuf) -> Result<SecretKey> {
     Ok(key)
 }
 
+/// Load authorized keys from a file (z32-encoded public keys, one per line)
+fn load_authorized_keys(path: &PathBuf) -> Result<HashSet<EndpointId>> {
+    let mut keys = HashSet::new();
+    if !path.exists() {
+        return Ok(keys);
+    }
+    let content = std::fs::read_to_string(path)?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match EndpointId::from_z32(line) {
+            Ok(endpoint_id) => {
+                keys.insert(endpoint_id);
+            }
+            Err(e) => {
+                warn!("Invalid authorized key '{}': {}", line, e);
+            }
+        }
+    }
+    info!("Loaded {} authorized keys from {}", keys.len(), path.display());
+    Ok(keys)
+}
+
+/// Hook to reject unauthorized connections based on EndpointId
+#[derive(Debug)]
+struct AuthHook {
+    allowed: Arc<HashSet<EndpointId>>,
+}
+
+impl AuthHook {
+    fn new(allowed: HashSet<EndpointId>) -> Self {
+        Self {
+            allowed: Arc::new(allowed),
+        }
+    }
+}
+
+impl EndpointHooks for AuthHook {
+    async fn after_handshake<'a>(
+        &'a self,
+        conn: &'a ConnectionInfo,
+    ) -> AfterHandshakeOutcome {
+        if self.allowed.is_empty() || self.allowed.contains(&conn.remote_id()) {
+            AfterHandshakeOutcome::Accept
+        } else {
+            warn!(
+                remote_id = %conn.remote_id().to_z32(),
+                "Rejecting unauthorized connection"
+            );
+            AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"unauthorized".to_vec(),
+            }
+        }
+    }
+}
+
 enum Command {
     Id {
         key_path: Option<PathBuf>,
@@ -99,117 +168,22 @@ enum Command {
         ssh_host: String,
         key_path: Option<PathBuf>,
         bind: String,
+        relay_url: Option<RelayUrl>,
+        mdns: bool,
+        authorized_keys: Option<PathBuf>,
     },
     Connect {
         peer_id: String,
         key_path: Option<PathBuf>,
         bind: String,
+        relay_url: Option<RelayUrl>,
+        mdns: bool,
     },
-}
-
-fn parse_args() -> Result<Command> {
-    use lexopt::prelude::*;
-
-    let mut parser = lexopt::Parser::from_env();
-    let mut key_path: Option<PathBuf> = None;
-
-    let command = match parser.next()? {
-        Some(Value(val)) => val.string()?,
-        _ => {
-            print_help();
-            bail!("No command specified");
-        }
-    };
-
-    match command.as_str() {
-        "id" => {
-            while let Some(arg) = parser.next()? {
-                match arg {
-                    Short('k') | Long("key") => {
-                        key_path = Some(parser.value()?.parse()?);
-                    }
-                    Short('h') | Long("help") => {
-                        print_id_help();
-                        std::process::exit(0);
-                    }
-                    _ => bail!("Unexpected argument: {:?}", arg),
-                }
-            }
-            Ok(Command::Id { key_path })
-        }
-        "serve" => {
-            let mut ssh_host = "127.0.0.1:22".to_string();
-            let mut bind = "0.0.0.0:0".to_string();
-
-            while let Some(arg) = parser.next()? {
-                match arg {
-                    Long("ssh-host") => {
-                        ssh_host = parser.value()?.parse()?;
-                    }
-                    Short('k') | Long("key") => {
-                        key_path = Some(parser.value()?.parse()?);
-                    }
-                    Long("bind") => {
-                        bind = parser.value()?.parse()?;
-                    }
-                    Short('h') | Long("help") => {
-                        print_serve_help();
-                        std::process::exit(0);
-                    }
-                    _ => bail!("Unexpected argument: {:?}", arg),
-                }
-            }
-            Ok(Command::Serve {
-                ssh_host,
-                key_path,
-                bind,
-            })
-        }
-        "connect" => {
-            let peer_id = match parser.next()? {
-                Some(Value(val)) => val.string()?,
-                _ => bail!("Missing peer ID argument"),
-            };
-
-            let mut bind = "0.0.0.0:0".to_string();
-
-            while let Some(arg) = parser.next()? {
-                match arg {
-                    Short('k') | Long("key") => {
-                        key_path = Some(parser.value()?.parse()?);
-                    }
-                    Long("bind") => {
-                        bind = parser.value()?.parse()?;
-                    }
-                    Short('h') | Long("help") => {
-                        print_connect_help();
-                        std::process::exit(0);
-                    }
-                    _ => bail!("Unexpected argument: {:?}", arg),
-                }
-            }
-            Ok(Command::Connect {
-                peer_id,
-                key_path,
-                bind,
-            })
-        }
-        "help" | "--help" | "-h" => {
-            print_help();
-            std::process::exit(0);
-        }
-        _ => {
-            bail!(
-                "Unknown command: {}. Use '-h' for usage information.",
-                command
-            );
-        }
-    }
 }
 
 fn print_help() {
     eprintln!(
-        "p2pssh - P2P SSH tunnel using iroh
+        "p2pssh - Privacy-first P2P SSH tunnel using iroh
 
 USAGE:
     p2pssh <COMMAND>
@@ -247,10 +221,13 @@ USAGE:
     p2pssh serve [OPTIONS]
 
 OPTIONS:
-    --ssh-host <ADDR>    SSH server address to forward to [default: 127.0.0.1:22]
-    -k, --key <PATH>     Path to secret key file
-    --bind <ADDR>        Bind address for the endpoint [default: 0.0.0.0:0]
-    -h, --help           Print help information"
+    --ssh-host <ADDR>           SSH server address to forward to [default: 127.0.0.1:22]
+    -k, --key <PATH>            Path to secret key file
+    --bind <ADDR>               Bind address for the endpoint [default: 0.0.0.0:0]
+    --relay-url <URL>           Custom relay URL (e.g. https://relay.example.com)
+    --mdns                      Enable mDNS discovery on local network
+    --authorized-keys <PATH>    Path to file with authorized client public keys (z32 format)
+    -h, --help                  Print help information"
     );
 }
 
@@ -265,16 +242,193 @@ ARGS:
     <PEER_ID>    Peer ID to connect to
 
 OPTIONS:
-    -k, --key <PATH>    Path to secret key file
-    --bind <ADDR>       Bind address for the endpoint [default: 0.0.0.0:0]
-    -h, --help          Print help information"
+    -k, --key <PATH>     Path to secret key file
+    --bind <ADDR>        Bind address for the endpoint [default: 0.0.0.0:0]
+    --relay-url <URL>    Custom relay URL (e.g. https://relay.example.com)
+    --mdns               Enable mDNS discovery on local network
+    -h, --help           Print help information"
     );
+}
+
+fn parse_args() -> Result<Command> {
+    use lexopt::prelude::*;
+
+    let mut parser = lexopt::Parser::from_env();
+    let mut key_path: Option<PathBuf> = None;
+
+    let command = match parser.next()? {
+        Some(Value(val)) => val.string()?,
+        _ => {
+            print_help();
+            bail!("No command specified");
+        }
+    };
+
+    match command.as_str() {
+        "id" => {
+            while let Some(arg) = parser.next()? {
+                match arg {
+                    Short('k') | Long("key") => {
+                        key_path = Some(parser.value()?.parse()?);
+                    }
+                    Short('h') | Long("help") => {
+                        print_id_help();
+                        std::process::exit(0);
+                    }
+                    _ => bail!("Unexpected argument: {:?}", arg),
+                }
+            }
+            Ok(Command::Id { key_path })
+        }
+        "serve" => {
+            let mut ssh_host = "127.0.0.1:22".to_string();
+            let mut bind = "0.0.0.0:0".to_string();
+            let mut relay_url: Option<RelayUrl> = None;
+            let mut mdns = false;
+            let mut authorized_keys: Option<PathBuf> = None;
+
+            while let Some(arg) = parser.next()? {
+                match arg {
+                    Long("ssh-host") => {
+                        ssh_host = parser.value()?.parse()?;
+                    }
+                    Short('k') | Long("key") => {
+                        key_path = Some(parser.value()?.parse()?);
+                    }
+                    Long("bind") => {
+                        bind = parser.value()?.parse()?;
+                    }
+                    Long("relay-url") => {
+                        let url: String = parser.value()?.parse()?;
+                        relay_url = Some(url.parse()?);
+                    }
+                    Long("mdns") => {
+                        mdns = true;
+                    }
+                    Long("authorized-keys") => {
+                        authorized_keys = Some(parser.value()?.parse()?);
+                    }
+                    Short('h') | Long("help") => {
+                        print_serve_help();
+                        std::process::exit(0);
+                    }
+                    _ => bail!("Unexpected argument: {:?}", arg),
+                }
+            }
+            Ok(Command::Serve {
+                ssh_host,
+                key_path,
+                bind,
+                relay_url,
+                mdns,
+                authorized_keys,
+            })
+        }
+        "connect" => {
+            let peer_id = match parser.next()? {
+                Some(Value(val)) => val.string()?,
+                _ => bail!("Missing peer ID argument"),
+            };
+
+            let mut bind = "0.0.0.0:0".to_string();
+            let mut relay_url: Option<RelayUrl> = None;
+            let mut mdns = false;
+
+            while let Some(arg) = parser.next()? {
+                match arg {
+                    Short('k') | Long("key") => {
+                        key_path = Some(parser.value()?.parse()?);
+                    }
+                    Long("bind") => {
+                        bind = parser.value()?.parse()?;
+                    }
+                    Long("relay-url") => {
+                        let url: String = parser.value()?.parse()?;
+                        relay_url = Some(url.parse()?);
+                    }
+                    Long("mdns") => {
+                        mdns = true;
+                    }
+                    Short('h') | Long("help") => {
+                        print_connect_help();
+                        std::process::exit(0);
+                    }
+                    _ => bail!("Unexpected argument: {:?}", arg),
+                }
+            }
+            Ok(Command::Connect {
+                peer_id,
+                key_path,
+                bind,
+                relay_url,
+                mdns,
+            })
+        }
+        "help" | "--help" | "-h" => {
+            print_help();
+            std::process::exit(0);
+        }
+        _ => {
+            bail!(
+                "Unknown command: {}. Use '-h' for usage information.",
+                command
+            );
+        }
+    }
+}
+
+/// Build an endpoint with privacy-preserving configuration.
+///
+/// - No public discovery (no PkarrPublisher / DNS lookup)
+/// - Optional custom relay for NAT traversal
+/// - Optional mDNS for local network discovery
+async fn build_endpoint(
+    secret_key: SecretKey,
+    bind: SocketAddr,
+    relay_url: Option<RelayUrl>,
+    mdns: bool,
+    authorized_keys: Option<HashSet<EndpointId>>,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
+    let endpoint_id = secret_key.public();
+    let mut builder = iroh::Endpoint::empty_builder()
+        .secret_key(secret_key)
+        .bind_addr(bind)?;
+
+    if let Some(url) = relay_url {
+        info!("Using custom relay: {}", url);
+        let relay_config = RelayConfig::from(url);
+        let relay_map = RelayMap::from(relay_config);
+        builder = builder.relay_mode(RelayMode::Custom(relay_map));
+    } else {
+        info!("No relay configured; direct connections only");
+        builder = builder.relay_mode(RelayMode::Disabled);
+    }
+
+    if !alpns.is_empty() {
+        builder = builder.alpns(alpns);
+    }
+
+    if mdns {
+        info!("Enabling mDNS discovery");
+        let mdns_lookup = iroh::address_lookup::MdnsAddressLookup::builder()
+            .build(endpoint_id)?;
+        builder = builder.address_lookup(mdns_lookup);
+    }
+
+    if let Some(keys) = authorized_keys
+        && !keys.is_empty()
+    {
+        info!("Enabling authorization for {} keys", keys.len());
+        builder = builder.hooks(AuthHook::new(keys));
+    }
+
+    let endpoint = builder.bind().await?;
+    Ok(endpoint)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber with env filter
-    // Default to WARN level, can be overridden with RUST_LOG environment variable
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -295,62 +449,84 @@ async fn main() -> Result<()> {
             ssh_host,
             key_path,
             bind,
-        } => cmd_serve(ssh_host, key_path, bind).await,
+            relay_url,
+            mdns,
+            authorized_keys,
+        } => cmd_serve(ssh_host, key_path, bind, relay_url, mdns, authorized_keys).await,
         Command::Connect {
             peer_id,
             key_path,
             bind,
-        } => cmd_connect(peer_id, key_path, bind).await,
+            relay_url,
+            mdns,
+        } => cmd_connect(peer_id, key_path, bind, relay_url, mdns).await,
     }
 }
 
 async fn cmd_id(key_path: Option<PathBuf>) -> Result<()> {
     let key_path = key_path.unwrap_or_else(default_key_path);
     let secret_key = load_or_generate_secret_key(&key_path)?;
-    let endpoint_id = secret_key.public();
-
-    println!("{}", &endpoint_id.to_z32());
+    println!("{}", secret_key.public().to_z32());
     Ok(())
 }
 
-async fn cmd_serve(ssh_host: String, key_path: Option<PathBuf>, bind: String) -> Result<()> {
+async fn cmd_serve(
+    ssh_host: String,
+    key_path: Option<PathBuf>,
+    bind: String,
+    relay_url: Option<RelayUrl>,
+    mdns: bool,
+    authorized_keys: Option<PathBuf>,
+) -> Result<()> {
     let key_path = key_path.unwrap_or_else(default_key_path);
     let secret_key = load_or_generate_secret_key(&key_path)?;
-    let endpoint_id = secret_key.public();
-    let peer_id = &endpoint_id.to_z32();
+    let peer_id = secret_key.public().to_z32();
 
     info!("Starting p2pssh server");
     info!("Peer ID: {}", peer_id);
 
-    // Parse bind address
     let bind_addr: SocketAddr = bind.parse()?;
+    let auth_keys_path = authorized_keys.unwrap_or_else(default_authorized_keys_path);
+    let authorized = load_authorized_keys(&auth_keys_path)?;
 
-    // Create iroh endpoint
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
-        .bind_addr(bind_addr)?
-        .bind()
-        .await?;
+    let endpoint = build_endpoint(
+        secret_key,
+        bind_addr,
+        relay_url.clone(),
+        mdns,
+        Some(authorized),
+        vec![ALPN.to_vec()],
+    )
+    .await?;
 
-    // Wait for the endpoint to come online
     info!("Waiting for endpoint to come online...");
     let _ = tokio::time::timeout(Duration::from_secs(30), endpoint.online()).await;
 
-    // Get system hostname for SSH config example
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "my-server".to_string());
 
-    // Print the peer ID for the user
     eprintln!("\n=== p2pssh Server Ready ===");
+    eprintln!("Peer ID: {}", peer_id);
+    if relay_url.is_some() {
+        eprintln!("Relay: custom");
+    } else {
+        eprintln!("Relay: disabled (direct only)");
+    }
     eprintln!("\nClients can configure ~/.ssh/config:");
     eprintln!("  Host {}", hostname);
     eprintln!("    ProxyCommand p2pssh connect {}", peer_id);
     eprintln!("    User <username>");
+    if relay_url.is_some() {
+        eprintln!("\nWith custom relay:");
+        eprintln!(
+            "    ProxyCommand p2pssh connect {} --relay-url <URL>{}",
+            peer_id,
+            if mdns { " --mdns" } else { "" }
+        );
+    }
 
-    // Accept incoming connections
     loop {
         select! {
             Some(incoming) = endpoint.accept() => {
@@ -371,7 +547,6 @@ async fn cmd_serve(ssh_host: String, key_path: Option<PathBuf>, bind: String) ->
         }
     }
 
-    // Graceful shutdown
     endpoint.close().await;
     info!("Server shutdown complete");
     Ok(())
@@ -383,60 +558,57 @@ async fn handle_incoming_connection(
 ) -> Result<()> {
     let connection = accepting.await?;
     let remote_id = connection.remote_id();
-    info!("Incoming connection from: {}", &remote_id.to_z32());
+    info!("Incoming connection from: {}", remote_id.to_z32());
 
-    // Accept bidirectional stream
     let (send, recv) = connection.accept_bi().await?;
-    info!(
-        "Accepted bidirectional stream from: {}",
-        &remote_id.to_z32()
-    );
+    info!("Accepted bidirectional stream from: {}", remote_id.to_z32());
 
-    // Connect to SSH server
     let tcp_stream = TcpStream::connect(&ssh_host).await?;
     info!("Connected to SSH server at: {}", ssh_host);
 
-    // Forward data bidirectionally
     forward_bidi(tcp_stream, recv, send).await?;
 
-    info!("Connection closed: {}", &remote_id.to_z32());
+    info!("Connection closed: {}", remote_id.to_z32());
     Ok(())
 }
 
-async fn cmd_connect(peer_id_str: String, key_path: Option<PathBuf>, bind: String) -> Result<()> {
+async fn cmd_connect(
+    peer_id_str: String,
+    key_path: Option<PathBuf>,
+    bind: String,
+    relay_url: Option<RelayUrl>,
+    mdns: bool,
+) -> Result<()> {
     let key_path = key_path.unwrap_or_else(default_key_path);
     let secret_key = load_or_generate_secret_key(&key_path)?;
-    let endpoint_id = PublicKey::from_z32(&peer_id_str)?;
+    let endpoint_id = EndpointId::from_z32(&peer_id_str)?;
 
     info!("Connecting to peer: {}", peer_id_str);
 
-    // Parse bind address
     let bind_addr: SocketAddr = bind.parse()?;
 
-    // Create iroh endpoint
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind_addr(bind_addr)?
-        .bind()
-        .await?;
+    let endpoint = build_endpoint(
+        secret_key,
+        bind_addr,
+        relay_url,
+        mdns,
+        None,
+        vec![],
+    )
+    .await?;
 
-    // Wait for endpoint to come online
     info!("Waiting for endpoint to come online...");
     let _ = tokio::time::timeout(Duration::from_secs(30), endpoint.online()).await;
 
-    // Create address from endpoint ID (uses discovery)
     let addr = EndpointAddr::from(endpoint_id);
 
-    // Connect to remote endpoint
     info!("Connecting to {}...", peer_id_str);
     let connection = endpoint.connect(addr, ALPN).await?;
     info!("Connected to {}", peer_id_str);
 
-    // Open bidirectional stream
     let (send, recv) = connection.open_bi().await?;
     info!("Opened bidirectional stream");
 
-    // Proxy stdin/stdout
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -446,56 +618,57 @@ async fn cmd_connect(peer_id_str: String, key_path: Option<PathBuf>, bind: Strin
     Ok(())
 }
 
-/// Forward data between TCP stream and QUIC streams
+/// Forward data between TCP stream and QUIC streams, shutting down gracefully
 async fn forward_bidi(tcp_stream: TcpStream, recv: RecvStream, send: SendStream) -> Result<()> {
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
-    // Forward from QUIC to TCP
-    let forward_to_tcp = async {
-        let mut buf = vec![0u8; 8192];
+    // QUIC → TCP
+    let quic_to_tcp = async {
+        let mut buf = vec![0u8; FORWARD_BUF_SIZE];
         let mut recv = recv;
-
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
                     tcp_write.write_all(&buf[..n]).await?;
-                    tcp_write.flush().await?;
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // Stream closed, shutdown TCP write half to signal EOF
+                    tcp_write.shutdown().await?;
+                    break;
+                }
                 Err(e) => return Err::<(), anyhow::Error>(e.into()),
             }
         }
         Ok(())
     };
 
-    // Forward from TCP to QUIC
-    let forward_from_tcp = async {
-        let mut buf = vec![0u8; 8192];
+    // TCP → QUIC
+    let tcp_to_quic = async {
+        let mut buf = vec![0u8; FORWARD_BUF_SIZE];
         let mut send = send;
-
         loop {
             match tokio::io::AsyncReadExt::read(&mut tcp_read, &mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    // TCP EOF, finish QUIC send stream
+                    let _ = send.finish();
+                    break;
+                }
                 Ok(n) => {
                     send.write_all(&buf[..n]).await?;
                 }
                 Err(e) => return Err::<(), anyhow::Error>(e.into()),
             }
         }
-        let _ = send.finish();
         Ok(())
     };
 
-    // Wait for either direction to complete
-    tokio::select! {
-        result = forward_to_tcp => result?,
-        result = forward_from_tcp => result?,
-    }
-
+    let (r1, r2) = tokio::join!(quic_to_tcp, tcp_to_quic);
+    r1?;
+    r2?;
     Ok(())
 }
 
-/// Forward data between stdio and QUIC streams
+/// Forward data between stdio and QUIC streams, shutting down gracefully
 async fn forward_bidi_stdio<R, W>(
     mut stdin: R,
     mut stdout: W,
@@ -506,11 +679,10 @@ where
     R: AsyncRead + Send + Sync + Unpin + 'static,
     W: AsyncWrite + Send + Sync + Unpin + 'static,
 {
-    // Forward from QUIC to stdout
-    let forward_to_stdout = async {
-        let mut buf = vec![0u8; 8192];
+    // QUIC → stdout
+    let quic_to_stdout = async {
+        let mut buf = vec![0u8; FORWARD_BUF_SIZE];
         let mut recv = recv;
-
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
@@ -524,29 +696,27 @@ where
         Ok(())
     };
 
-    // Forward from stdin to QUIC
-    let forward_from_stdin = async {
-        let mut buf = vec![0u8; 8192];
+    // stdin → QUIC
+    let stdin_to_quic = async {
+        let mut buf = vec![0u8; FORWARD_BUF_SIZE];
         let mut send = send;
-
         loop {
             match tokio::io::AsyncReadExt::read(&mut stdin, &mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    let _ = send.finish();
+                    break;
+                }
                 Ok(n) => {
                     send.write_all(&buf[..n]).await?;
                 }
                 Err(e) => return Err::<(), anyhow::Error>(e.into()),
             }
         }
-        let _ = send.finish();
         Ok(())
     };
 
-    // Wait for either direction to complete
-    tokio::select! {
-        result = forward_to_stdout => result?,
-        result = forward_from_stdin => result?,
-    }
-
+    let (r1, r2) = tokio::join!(quic_to_stdout, stdin_to_quic);
+    r1?;
+    r2?;
     Ok(())
 }
