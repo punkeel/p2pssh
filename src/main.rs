@@ -556,20 +556,33 @@ async fn handle_incoming_connection(
     accepting: iroh::endpoint::Accepting,
     ssh_host: String,
 ) -> Result<()> {
+    let remote_addr = accepting.remote_addr();
     let connection = accepting.await?;
     let remote_id = connection.remote_id();
-    info!("Incoming connection from: {}", remote_id.to_z32());
+
+    match &remote_addr {
+        iroh::endpoint::IncomingAddr::Ip(addr) => {
+            let s = addr.to_string();
+            if s.starts_with("100.") {
+                eprintln!("CONN Tailscale: remote_id={} addr={}", remote_id.to_z32(), addr);
+            } else {
+                eprintln!("CONN direct: remote_id={} addr={}", remote_id.to_z32(), addr);
+            }
+        }
+        iroh::endpoint::IncomingAddr::Relay { url, .. } => {
+            eprintln!("CONN relay: remote_id={} relay={}", remote_id.to_z32(), url);
+        }
+        _ => {
+            eprintln!("CONN other: remote_id={} addr={:?}", remote_id.to_z32(), remote_addr);
+        }
+    }
 
     let (send, recv) = connection.accept_bi().await?;
-    info!("Accepted bidirectional stream from: {}", remote_id.to_z32());
-
     let tcp_stream = TcpStream::connect(&ssh_host).await?;
-    info!("Connected to SSH server at: {}", ssh_host);
 
-    forward_bidi(tcp_stream, recv, send).await?;
-
-    info!("Connection closed: {}", remote_id.to_z32());
-    Ok(())
+    let res = forward_bidi(tcp_stream, recv, send).await;
+    eprintln!("CONN closed: remote_id={}", remote_id.to_z32());
+    res
 }
 
 async fn cmd_connect(
@@ -616,10 +629,11 @@ async fn cmd_connect(
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    forward_bidi_stdio(stdin, stdout, recv, send).await?;
+    let result = forward_bidi_stdio(stdin, stdout, recv, send).await;
 
     info!("Connection closed");
-    Ok(())
+    endpoint.close().await;
+    result
 }
 
 /// Forward data between TCP stream and QUIC streams, shutting down gracefully
